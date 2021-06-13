@@ -12,6 +12,10 @@ func (r RollingBuffer) Len() int {
 	return r.length
 }
 
+func (r RollingBuffer) Cap() int {
+	return cap(r.buf)
+}
+
 func (r *RollingBuffer) Clear() {
 	r.offset = 0
 	r.length = 0
