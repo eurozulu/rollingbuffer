@@ -24,6 +24,26 @@ func (b *RollingBuffer) Clear() {
 	b.length = 0
 }
 
+func (b *RollingBuffer) Bytes() []byte {
+	by := make([]byte, 0, b.length)
+	l := b.offset + b.length
+	clip := 0
+	if l > cap(b.buf) {
+		clip = l % cap(b.buf)
+		l = cap(b.buf)
+	}
+	by = append(by, b.buf[b.offset: l]...)
+	if clip > 0 {
+		by = append(by, b.buf[:clip]...)
+	}
+	return by
+}
+
+func (b *RollingBuffer) ReadBytes(n int) (int, []byte) {
+	by := make([]byte, n)
+	l, _ := b.Read(by)
+	return l, by
+}
 
 func (b *RollingBuffer) Read(p []byte) (n int, err error) {
 	if b.length == 0 {
@@ -98,7 +118,7 @@ func (b RollingBuffer) freeSpaceStart() (index int, length int) {
 	if e >= cap(b.buf) {
 		index = e % cap(b.buf)
 	}
-	return index, b.offset - index
+	return index, b.offset - index 
 }
 
 func NewRollingBuffer(capacity int) *RollingBuffer {
