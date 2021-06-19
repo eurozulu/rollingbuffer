@@ -1,126 +1,150 @@
 package rollingbuffer
 
-import (
-	"io"
-	"bytes"
-)
+import "io"
 
 type RollingBuffer struct {
-	buf    []byte
-	offset int
-	length int
+	base          []byte
+	buckets       [2][]byte
+	readOverflow  bool
+	writeOverflow bool
 }
 
-func (b RollingBuffer) Len() int {
-	return b.length
+func NewRollingBuffer(size int) *RollingBuffer {
+	return NewRollingBufferBytes(make([]byte, size))
 }
 
-func (b RollingBuffer) Cap() int {
-	return cap(b.buf)
-}
-
-func (b *RollingBuffer) Clear() {
-	b.offset = 0
-	b.length = 0
-}
-
-func (b *RollingBuffer) Bytes() []byte {
-	by := make([]byte, 0, b.length)
-	l := b.offset + b.length
-	clip := 0
-	if l > cap(b.buf) {
-		clip = l % cap(b.buf)
-		l = cap(b.buf)
-	}
-	by = append(by, b.buf[b.offset: l]...)
-	if clip > 0 {
-		by = append(by, b.buf[:clip]...)
-	}
-	return by
-}
-
-func (b *RollingBuffer) ReadBytes(n int) (int, []byte) {
-	by := make([]byte, n)
-	l, _ := b.Read(by)
-	return l, by
+func NewRollingBufferBytes(by []byte) *RollingBuffer {
+	return &RollingBuffer{base: by}
 }
 
 func (b *RollingBuffer) Read(p []byte) (n int, err error) {
-	if b.length == 0 {
+	if b.Len() == 0 {
 		return 0, io.EOF
 	}
-
-	var count int
-	for count < cap(p) {
-		l := b.length
-		if l > cap(p)-count {
-			l = cap(p) - count
-		}
-		e := b.offset + l
-		if e > cap(b.buf) {
-			e = cap(b.buf)
-		}
-		c := (e - b.offset)
-		copy(p[count:], b.buf[b.offset:e])
-		count += c
-		b.offset = (b.offset + c) % cap(b.buf)
-		b.length -= c
-
-		if b.length < 0 {
-			break
-		}
+	l := len(p)
+	if l > b.Len() {
+		l = b.Len()
 	}
 
-	return count, nil
+	for n < l {
+		i := 0
+		if b.readOverflow {
+			i = 1
+		}
+		bk := b.buckets[i]
+		if len(bk) == 0 {
+			// no data in current bucket, flip to other bucket.
+			b.readOverflow = !b.readOverflow
+			continue
+		}
+		bl := l - n
+		if bl > len(bk) {
+			bl = len(bk)
+		}
+
+		copy(p[n:], bk[0:bl])
+		b.buckets[i] = bk[bl:]
+		n += bl
+	}
+	return n, nil
 }
 
 func (b *RollingBuffer) Write(p []byte) (n int, err error) {
-	i, er := b.ReadFrom(bytes.NewBuffer(p))
-	return int(i), er
+	bfree := b.Cap() - b.Len()
+	l := len(p)
+	if l > bfree {
+		l = bfree
+	}
+	if l == 0 {
+		// no more room in the inn
+		return 0, nil
+	}
+
+	for n < l {
+		i := 0
+		if b.writeOverflow {
+			i = 1
+		}
+		bk := b.buckets[i]
+
+		if cap(bk) == 0 {
+			bk = b.base[:0]
+		}
+		bfree = cap(bk) - len(bk)
+		if bfree == 0 {
+			// bucket is already full
+			b.writeOverflow = !b.writeOverflow
+			continue
+		}
+		// how much do we copy
+		bl := l - n
+		if bl > bfree {
+			bl = bfree
+		}
+		// append to end of bucket and move n counter on.
+		nn := n + bl
+		b.buckets[i] = append(bk, p[n:nn]...)
+		n = nn
+	}
+	return n, nil
+}
+
+func (b RollingBuffer) Len() int {
+	return len(b.buckets[0]) + len(b.buckets[1])
+}
+func (b RollingBuffer) Cap() int {
+	return cap(b.base)
+}
+
+func (b *RollingBuffer) ReadByte() (byte, error) {
+	p := []byte{0}
+	_, err := b.Read(p)
+	if err != nil {
+		return 0, err
+	}
+	return p[0], nil
+}
+
+func (b *RollingBuffer) UnreadByte() error {
+	if b.Len() == b.Cap() {
+		return io.ErrShortBuffer
+	}
+	i := 0
+	if b.readOverflow {
+		i = 1
+	}
+	bk := b.buckets[i]
+	bos := b.Cap() - cap(bk)
+	if bos <= 0 {
+		// nothing to unread
+		return io.ErrUnexpectedEOF
+	}
+	b.buckets[i] = b.base[bos-1 : bos+len(bk)]
+	return nil
+}
+
+func (b *RollingBuffer) WriteByte(c byte) error {
+	_, err := b.Write([]byte{c})
+	return err
 }
 
 func (b *RollingBuffer) ReadFrom(r io.Reader) (n int64, err error) {
-	var c int
-	i, l := b.freeSpaceEnd()
-	if l > 0 {
-		c, err = r.Read(b.buf[i:])
-		if err != nil {
-			return
-		}
+	bFree := b.Cap() - b.Len()
+	if bFree == 0 {
+		return 0, nil
 	}
-	i, l = b.freeSpaceStart()
-	if l > 0 {
-		cc, er := r.Read(b.buf[i:l])
-		if er != nil {
-			return
-		}
-		c += cc
+	by := make([]byte, bFree)
+	_, err = r.Read(by)
+	if err != nil {
+		return 0, err
 	}
-	b.length += c
-	return int64(c), nil
+	l, err := b.Write(by)
+	if err != nil {
+		return 0, err
+	}
+	return int64(l), nil
 }
 
-// freeIndexEnd finds the first free index at the end of the buffer.
-// returns -1 if there is no free space after the last occupied position.
-func (b RollingBuffer) freeSpaceEnd() (index int, length int) {
-	index = b.offset + b.length
-	if index >= cap(b.buf) {
-		index = cap(b.buf)
-	}
-	length = cap(b.buf) - index
-	return index, length
-}
-
-// freeIndexStart finds the first free index at the beginning of the buffer
-// returns -1 if there is no free space at the beginning of the buffer
-func (b RollingBuffer) freeSpaceStart() (index int, length int) {
-	e := b.offset + b.length
-	if e >= cap(b.buf) {
-		index = e % cap(b.buf)
-	}
-	return index, b.offset - index 
-}
-
-func NewRollingBuffer(capacity int) *RollingBuffer {
-	return &RollingBuffer{buf: make([]byte, capacity)}
+func (b *RollingBuffer) WriteTo(w io.Writer) (n int64, err error) {
+	panic("implement me")
 }
