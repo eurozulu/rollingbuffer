@@ -1,6 +1,8 @@
 package rollingbuffer
 
-import "io"
+import (
+	"io"
+)
 
 type RollingBuffer struct {
 	base          []byte
@@ -21,32 +23,9 @@ func (b *RollingBuffer) Read(p []byte) (n int, err error) {
 	if b.Len() == 0 {
 		return 0, io.EOF
 	}
-	l := len(p)
-	if l > b.Len() {
-		l = b.Len()
-	}
-
-	for n < l {
-		i := 0
-		if b.readOverflow {
-			i = 1
-		}
-		bk := b.buckets[i]
-		if len(bk) == 0 {
-			// no data in current bucket, flip to other bucket.
-			b.readOverflow = !b.readOverflow
-			continue
-		}
-		bl := l - n
-		if bl > len(bk) {
-			bl = len(bk)
-		}
-
-		copy(p[n:], bk[0:bl])
-		b.buckets[i] = bk[bl:]
-		n += bl
-	}
-	return n, nil
+	by := b.Next(len(p))
+	copy(p, by)
+	return len(by), nil
 }
 
 func (b *RollingBuffer) Write(p []byte) (n int, err error) {
@@ -97,12 +76,11 @@ func (b RollingBuffer) Cap() int {
 }
 
 func (b *RollingBuffer) ReadByte() (byte, error) {
-	p := []byte{0}
-	_, err := b.Read(p)
-	if err != nil {
-		return 0, err
+	by := b.Next(1)
+	if len(by) > 0 {
+		return by[0], nil
 	}
-	return p[0], nil
+	return 0, io.EOF
 }
 
 func (b *RollingBuffer) UnreadByte() error {
@@ -145,6 +123,78 @@ func (b *RollingBuffer) ReadFrom(r io.Reader) (n int64, err error) {
 	return int64(l), nil
 }
 
+func (b *RollingBuffer) Next(n int) []byte {
+	l := b.Len()
+	if l == 0 {
+		return nil
+	}
+	if n > l {
+		n = l
+	}
+	// stop looking once we flip back to where we started
+	firstState := b.readOverflow
+	var by []byte
+	for len(by) < n {
+		bk := b.buckets[b.readBucketIndex()]
+		if len(bk) == 0 {
+			// no data in current bucket, flip to other bucket.
+			b.readOverflow = !b.readOverflow
+			if b.readOverflow == firstState {
+				break
+			}
+			continue
+		}
+		bl := n - len(by)
+		if bl > len(bk) {
+			bl = len(bk)
+		}
+
+		by = append(by, bk[0:bl]...)
+		b.buckets[b.readBucketIndex()] = bk[bl:]
+	}
+	return by
+}
+
 func (b *RollingBuffer) WriteTo(w io.Writer) (n int64, err error) {
-	panic("implement me")
+	l := b.Len()
+	if l == 0 {
+		return 0, io.EOF
+	}
+
+	// stop looking once we flip back to where we started
+	firstState := b.readOverflow
+
+	for n < int64(l) {
+		bk := b.buckets[b.readBucketIndex()]
+		if len(bk) == 0 {
+			// no data in current bucket, flip to other bucket.
+			b.readOverflow = !b.readOverflow
+			if b.readOverflow == firstState {
+				break
+			}
+			continue
+		}
+		i, err := w.Write(bk)
+		if err != nil {
+			return int64(i), err
+		}
+
+		// trim off the bytes read
+		b.buckets[b.readBucketIndex()] = bk[i:]
+		n += int64(i)
+	}
+	return n, nil
+}
+
+func (b *RollingBuffer) readBucketIndex() int {
+	if b.readOverflow {
+		return 1
+	}
+	return 0
+}
+func (b *RollingBuffer) writeIndex() int {
+	if b.writeOverflow {
+		return 1
+	}
+	return 0
 }
